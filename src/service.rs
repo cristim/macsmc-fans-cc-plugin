@@ -18,29 +18,28 @@ use crate::{
     },
 };
 use anyhow::Result;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use sysinfo::Product;
 use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
 pub struct FanService {
     start_time: Instant,
-    fans: Vec<Fan>,
+    fans: Arc<Vec<Fan>>,
     device: Device,
 }
 
 impl FanService {
-    pub async fn new() -> Result<Self> {
-        let fans = crate::fan::probe().await?;
+    pub fn new(fans: Arc<Vec<Fan>>) -> Self {
         let mut channels = HashMap::new();
 
-        for fan in &fans {
+        for fan in fans.iter() {
             channels.insert(
                 fan.id().to_string(),
                 ChannelInfo {
                     label: Some(fan.label().into()),
                     options: Some(Options::SpeedOptions(SpeedOptions {
-                        min_duty: u32::from(fan.min_rpm() / fan.max_rpm()),
+                        min_duty: fan.min_duty(),
                         max_duty: 100,
                         fixed_enabled: true,
                         extension: None,
@@ -49,7 +48,7 @@ impl FanService {
             );
         }
 
-        Ok(Self {
+        Self {
             start_time: Instant::now(),
             device: Device {
                 id: SERVICE_ID.into(),
@@ -61,7 +60,14 @@ impl FanService {
                 }),
             },
             fans,
-        })
+        }
+    }
+
+    fn fan(&self, channel_id: &str) -> Result<&Fan, Status> {
+        self.fans
+            .iter()
+            .find(|fan| fan.id().to_string() == channel_id)
+            .ok_or_else(|| Status::invalid_argument("Unknown channel ID"))
     }
 }
 
@@ -100,6 +106,8 @@ impl DeviceService for FanService {
         &self,
         _request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
+        crate::fan::release_all(&self.fans)?;
+
         Ok(Response::new(ShutdownResponse {}))
     }
 
@@ -129,8 +137,11 @@ impl DeviceService for FanService {
 
     async fn reset_channel(
         &self,
-        _request: Request<ResetChannelRequest>,
+        request: Request<ResetChannelRequest>,
     ) -> Result<Response<ResetChannelResponse>, Status> {
+        self.fan(&request.get_ref().channel_id)?
+            .release_to_firmware()?;
+
         Ok(Response::new(ResetChannelResponse {}))
     }
 
@@ -145,15 +156,10 @@ impl DeviceService for FanService {
         &self,
         request: Request<FixedDutyRequest>,
     ) -> Result<Response<FixedDutyResponse>, Status> {
-        for fan in &self.fans {
-            if fan.id().to_string() == request.get_ref().channel_id {
-                let rpm = fan.max_rpm() * request.get_ref().duty as u32 / 100u32;
-                fan.set_target_rpm(rpm)?;
-                return Ok(Response::new(FixedDutyResponse {}));
-            }
-        }
+        let fan = self.fan(&request.get_ref().channel_id)?;
+        fan.set_target_rpm(fan.duty_to_rpm(request.get_ref().duty))?;
 
-        Err(Status::invalid_argument("Unknown channel ID"))
+        Ok(Response::new(FixedDutyResponse {}))
     }
 
     async fn speed_profile(

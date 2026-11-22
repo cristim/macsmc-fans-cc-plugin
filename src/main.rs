@@ -44,7 +44,8 @@ async fn main() -> Result<()> {
     setup_logging()?;
     info!("Starting {SERVICE_ID} v{VERSION}");
 
-    let service = FanService::new().await?;
+    let fans = std::sync::Arc::new(fan::probe().await?);
+    let service = FanService::new(fans.clone());
 
     // The default socket path for device services requires privileged access. Using the following
     // will work for both privileged and non-privileged services.
@@ -62,13 +63,18 @@ async fn main() -> Result<()> {
         }
     };
     let uds_stream = UnixListenerStream::new(uds);
-    Server::builder()
+    let served = Server::builder()
         .add_service(DeviceServiceServer::new(service))
         .serve_with_incoming_shutdown(uds_stream, run_token.cancelled())
-        .await?;
+        .await;
+    // systemd can stop this plugin before the daemon sends its shutdown request, so never leave
+    // the fans on a manual target when exiting.
+    if let Err(err) = fan::release_all(&fans) {
+        error!("Failed to return fans to firmware control: {err}");
+    }
     cleanup_uds(&uds_path).await;
 
-    Ok(())
+    served.map_err(Into::into)
 }
 
 /// The CoolerControl daemon will pass the current daemon's log level as an environment variable.
