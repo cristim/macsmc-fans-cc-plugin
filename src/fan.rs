@@ -73,6 +73,13 @@ impl Fan {
             .trim()
             .parse()
             .unwrap();
+        // With a minimum of 0 the kernel would take a release (target 0) as a manual stop.
+        if min_rpm == 0 || min_rpm > max_rpm {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("fan{id} reports an invalid speed range {min_rpm}..{max_rpm} rpm"),
+            ));
+        }
 
         Ok(Self {
             id,
@@ -93,10 +100,6 @@ impl Fan {
 
     pub(crate) fn label(&self) -> &str {
         &self.label
-    }
-
-    pub(crate) fn min_rpm(&self) -> u32 {
-        self.min_rpm
     }
 
     pub(crate) fn max_rpm(&self) -> u32 {
@@ -120,5 +123,79 @@ impl Fan {
             .write_at(lexical::to_string(rpm).as_bytes(), 0)?;
 
         Ok(())
+    }
+
+    pub(crate) fn min_duty(&self) -> u32 {
+        min_duty(self.min_rpm, self.max_rpm)
+    }
+
+    pub(crate) fn duty_to_rpm(&self, duty: i32) -> u32 {
+        duty_to_rpm(duty, self.min_rpm, self.max_rpm)
+    }
+
+    /// Return the fan to automatic control by the SMC firmware.
+    ///
+    /// The kernel driver treats a target of 0 as a request to leave manual mode.
+    pub(crate) fn release_to_firmware(&self) -> io::Result<()> {
+        self.set_target_rpm(0)
+    }
+}
+
+/// Release every fan, attempting all of them even if one fails.
+pub(crate) fn release_all(fans: &[Fan]) -> io::Result<()> {
+    let mut result = Ok(());
+    for fan in fans {
+        if let Err(err) = fan.release_to_firmware() {
+            log::error!("failed to release fan {} to firmware: {err}", fan.id());
+            result = Err(err);
+        }
+    }
+    result
+}
+
+/// Lowest duty whose target still reaches min_rpm; the kernel rejects non-zero targets below it.
+fn min_duty(min_rpm: u32, max_rpm: u32) -> u32 {
+    (min_rpm * 100).div_ceil(max_rpm)
+}
+
+/// Clamp so a low or negative duty never writes 0, which would hand the fan back to firmware.
+fn duty_to_rpm(duty: i32, min_rpm: u32, max_rpm: u32) -> u32 {
+    let duty = duty.clamp(min_duty(min_rpm, max_rpm) as i32, 100) as u32;
+    max_rpm * duty / 100
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // fan1_min/fan1_max from a 13-inch M1 MacBook Pro and a 14-inch MacBook Pro.
+    const FANS: [(u32, u32); 2] = [(1199, 7199), (2317, 6550)];
+
+    #[test]
+    fn min_duty_is_the_lowest_duty_reaching_min_rpm() {
+        assert_eq!(min_duty(1199, 7199), 17);
+        assert_eq!(min_duty(2317, 6550), 36);
+        for (min, max) in FANS {
+            let lowest = min_duty(min, max);
+            assert!(max * lowest / 100 >= min);
+            assert!(max * (lowest - 1) / 100 < min);
+        }
+    }
+
+    #[test]
+    fn every_duty_maps_to_a_target_the_kernel_accepts() {
+        for (min, max) in FANS {
+            for duty in -50..=150 {
+                let rpm = duty_to_rpm(duty, min, max);
+                assert!((min..=max).contains(&rpm), "duty {duty} gave {rpm} rpm");
+            }
+        }
+    }
+
+    #[test]
+    fn low_duty_clamps_to_min_duty_instead_of_releasing() {
+        assert_eq!(duty_to_rpm(0, 1199, 7199), duty_to_rpm(17, 1199, 7199));
+        assert_eq!(duty_to_rpm(-1, 1199, 7199), 1223);
+        assert_eq!(duty_to_rpm(100, 1199, 7199), 7199);
     }
 }
